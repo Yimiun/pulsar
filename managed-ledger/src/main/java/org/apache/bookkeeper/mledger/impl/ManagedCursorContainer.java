@@ -42,7 +42,8 @@ import org.apache.commons.lang3.tuple.Pair;
  * <a href="https://en.wikipedia.org/wiki/Heap_(data_structure)#Implementation">here</a>
  * <p>
  * The heap is updated and kept sorted when a cursor is updated.
- *
+ * 一个基于小顶堆的数据结构，每次对于该堆数据结构的增删改，都会让版本号+1，并且触发小顶堆的重排序。
+ * 为了始终拿到最慢的消费进度（以标志垃圾回收位置？）
  */
 public class ManagedCursorContainer implements Iterable<ManagedCursor> {
 
@@ -238,7 +239,7 @@ public class ManagedCursorContainer implements Iterable<ManagedCursor> {
             if (item == null || item.idx == -1) {
                 return null;
             }
-
+            // 直取最小堆堆顶
             PositionImpl previousSlowestConsumer = heap.get(0).position;
             item.position = (PositionImpl) newPosition;
             version = DataVersion.getNextVersion(version);
@@ -249,9 +250,11 @@ public class ManagedCursorContainer implements Iterable<ManagedCursor> {
 
             // When the cursor moves forward, we need to push it toward the
             // bottom of the tree and push it up if a reset was done
+            // 比父节点的消费进度快（更大），那就走沉降逻辑，可能会发生交换
             if (item.idx == 0 || getParent(item).position.compareTo(item.position) <= 0) {
                 siftDown(item);
             } else {
+            // 比父节点消费进度慢，那就一定要交换，走上升逻辑
                 siftUp(item);
             }
             PositionImpl newSlowestConsumer = heap.get(0).position;
@@ -391,6 +394,7 @@ public class ManagedCursorContainer implements Iterable<ManagedCursor> {
 
     /**
      * Push the item up towards the root of the tree (the lowest reading position).
+     * 小顶堆
      */
     private void siftUp(Item item) {
         Item parent = getParent(item);
@@ -402,6 +406,7 @@ public class ManagedCursorContainer implements Iterable<ManagedCursor> {
 
     /**
      * Push the item down towards the bottom of the tree (the highest reading position).
+     * 沉降交换后可能存在的大值，通过与其左右子节点比较，再比较左右子节点谁大谁小，从而正确互换两个节点，重复到无法沉降。
      */
     private void siftDown(final Item item) {
         while (true) {

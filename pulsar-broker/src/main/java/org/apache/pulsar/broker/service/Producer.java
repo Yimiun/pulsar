@@ -211,6 +211,7 @@ public class Producer {
 
     public boolean checkAndStartPublish(long producerId, long sequenceId, ByteBuf headersAndPayload, long batchSize,
                                         Position position) {
+        // shadowTopic : 新特性，指那些不必位于lookup broker上的假主题，可以用于任意broker消费某主题。
         if (!isShadowTopic && position != null) {
             cnx.execute(() -> {
                 cnx.getCommandSender().sendSendError(producerId, sequenceId, ServerError.NotAllowedError,
@@ -269,6 +270,7 @@ public class Producer {
 
     private void publishMessageToTopic(ByteBuf headersAndPayload, long sequenceId, long batchSize, boolean isChunked,
                                        boolean isMarker, Position position) {
+        // 本次发送的上下文
         MessagePublishContext messagePublishContext =
                 MessagePublishContext.get(this, sequenceId, msgIn, headersAndPayload.readableBytes(),
                         batchSize, isChunked, System.nanoTime(), isMarker, position);
@@ -285,6 +287,8 @@ public class Producer {
                 highestSequenceId, msgIn, headersAndPayload.readableBytes(), batchSize,
                 isChunked, System.nanoTime(), isMarker, position);
         if (brokerInterceptor != null) {
+            // 插件模式，靠配置文件和nar包配置的插件，在implements拦截器接口后可以打成nar包，在配置里指定nar包位置，通过META-INF里的yaml指定类名
+            // 支持多个拦截器，可以做些别的拓展，这里的拦截器对象是个集合。
             brokerInterceptor
                     .onMessagePublish(this, headersAndPayload, messagePublishContext);
         }

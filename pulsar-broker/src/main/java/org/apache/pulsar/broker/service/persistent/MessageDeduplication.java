@@ -48,6 +48,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Class that contains all the logic to control and perform the deduplication on the broker side.
+ * <p>消息去重器</p>
  */
 public class MessageDeduplication {
 
@@ -100,6 +101,7 @@ public class MessageDeduplication {
 
     // Map that contains the highest sequenceId that have been sent by each producers. The map will be updated before
     // the messages are persisted
+    // 非持久化的，发生在持久化消息之前，为了异步的性能着想，判断使用的是这个，如果出现消息拥堵高峰，那么会在判断时出现Unknown，此时强制这个map同步为持久化map
     @VisibleForTesting
     final ConcurrentOpenHashMap<String, Long> highestSequencedPushed =
             ConcurrentOpenHashMap.<String, Long>newBuilder()
@@ -109,6 +111,7 @@ public class MessageDeduplication {
 
     // Map that contains the highest sequenceId that have been persistent by each producers. The map will be updated
     // after the messages are persisted
+    // 真实落盘的最大sequenceId map，该map会被作为快照定期持久化到ledger，以防止broker抽风挂了
     @VisibleForTesting
     final ConcurrentOpenHashMap<String, Long> highestSequencedPersisted =
             ConcurrentOpenHashMap.<String, Long>newBuilder()
@@ -325,7 +328,7 @@ public class MessageDeduplication {
 
     /**
      * Assess whether the message was already stored in the topic.
-     *
+     * 整体的去重是通过每次局部的保证来保证的，每次局部去重都维护一个当前服务端处理消息的最大sequenceID，任何小于这个值的都是非法的重复值
      * @return true if the message should be published or false if it was recognized as a duplicate
      */
     public MessageDupStatus isDuplicate(PublishContext publishContext, ByteBuf headersAndPayload) {
@@ -338,6 +341,7 @@ public class MessageDeduplication {
         long highestSequenceId = Math.max(publishContext.getHighestSequenceId(), sequenceId);
         MessageMetadata md = null;
         if (producerName.startsWith(replicatorPrefix)) {
+            // 如果是复制来的消息，不能使用当前生产者信息，要从消息头读出来原始生产者
             // Message is coming from replication, we need to use the original producer name and sequence id
             // for the purpose of deduplication and not rely on the "replicator" name.
             int readerIndex = headersAndPayload.readerIndex();

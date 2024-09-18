@@ -23,6 +23,9 @@
   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <packaging>pom</packaging>
+  <modules>
+    <module>pulsar-message-tracker</module>
+  </modules>
   <parent>
     <groupId>org.apache</groupId>
     <artifactId>apache</artifactId>
@@ -79,6 +82,7 @@ flexible messaging model and an intuitive client API.</description>
   <properties>
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
+    <pulsar.basedir>E:\Java\code\pulsar-origin\pulsar</pulsar.basedir>
     <pulsar.broker.compiler.release>${maven.compiler.target}</pulsar.broker.compiler.release>
     <pulsar.client.compiler.release>8</pulsar.client.compiler.release>
 

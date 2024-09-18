@@ -40,6 +40,7 @@ import org.openjdk.jmh.annotations.Warmup;
 @State(Scope.Thread)
 public class AsyncTokenBucketBenchmark {
     private AsyncTokenBucket asyncTokenBucket;
+    // 8纳秒更新一次
     private DefaultMonotonicSnapshotClock monotonicSnapshotClock =
             new DefaultMonotonicSnapshotClock(TimeUnit.MILLISECONDS.toNanos(8), System::nanoTime);
 

@@ -313,7 +313,7 @@ public class PendingReadsManager {
         }
     }
 
-
+    // pending read:未读信息
     void readEntries(ReadHandle lh, long firstEntry, long lastEntry, boolean shouldCacheEntry,
                      final AsyncCallbacks.ReadEntriesCallback callback, Object ctx) {
         final PendingReadKey key = new PendingReadKey(firstEntry, lastEntry);

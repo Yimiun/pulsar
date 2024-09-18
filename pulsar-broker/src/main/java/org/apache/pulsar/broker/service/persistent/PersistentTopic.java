@@ -616,6 +616,12 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
             decrementPendingWriteOpsAndCheck();
             return;
         }
+        // 不是那么讲究，fenced不需要读锁保持原子性，想发就发吧反正下一条也发不出去了
+        // 也可以得出一个结论：对于那种单次生效，多次提交的任务，不需要原子性保证，fence前一条还是后一条也没什么区别
+        // 但是对于持久生效的，例如subscription/replicator，就必须维持其原子性，保证依赖于状态的添加/删除/修改的复合操作 是原子的
+        // 这也说明了一个问题：在coding中，多次访问的热代码，反而不需要加太多锁，最多是synchronized偏向，属于fastPath，因为他们不是那么敏感，
+        // 甚至可以依靠抛异常的形式揭露出多线程异常，而不是去主动预防
+        // 相较而言少访问的资源access方法，就要维护其原子性了，属于slowPath
         if (isExceedMaximumMessageSize(headersAndPayload.readableBytes(), publishContext)) {
             publishContext.completed(new NotAllowedException("Exceed maximum message size"), -1, -1);
             decrementPendingWriteOpsAndCheck();
@@ -735,6 +741,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         PositionImpl position = (PositionImpl) pos;
 
         // Message has been successfully persisted
+        // 更新一下持久化的那个sequenceID map
         messageDeduplication.recordMessagePersisted(publishContext, position);
 
         // in order to sync the max position when cursor read entries
@@ -1963,6 +1970,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         return compactionThreshold != null && compactionThreshold > 0;
     }
 
+    // 定时压缩
     public void checkCompaction() {
         TopicName name = TopicName.get(topic);
         try {
@@ -2071,6 +2079,11 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                     if (replicationClient == null) {
                         return;
                     }
+                    // 锁的目的是必须要相对close方法的符合原子判断
+                    // 否则会出现close时清理资源，但是这个线程还是创建了新的replicator的情况。
+                    // 以前这里并没有读锁，这将导致：检查该topic是否关闭与添加游标不是原子的，若在这两步之间有一个线程调用了unloadBundle，
+                    // 就会触发关闭逻辑，此时会出现它在关闭时清空replicators资源，但是该线程还未添加，轮到该线程时，再添加，出现了孤儿游标资源。
+
                     lock.readLock().lock();
                     try {
                         if (isClosingOrDeleting) {
@@ -4115,7 +4128,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
             decrementPendingWriteOpsAndCheck();
             return;
         }
-
+        // 消息去重
         MessageDeduplication.MessageDupStatus status =
                 messageDeduplication.isDuplicate(publishContext, headersAndPayload);
         switch (status) {
@@ -4345,6 +4358,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         if (isDelayedDeliveryEnabled()) {
             long maxDeliveryDelayInMs = getDelayedDeliveryMaxDelayInMillis();
             if (maxDeliveryDelayInMs > 0) {
+                // 和resetReaderIndex配套使用的，abstractByteBuf使用额外一个mark变量存下来当前位置，用于后续赋值恢复，应该是用来读取后恢复原位的，不影响后续重新读取。
                 headersAndPayload.markReaderIndex();
                 MessageMetadata msgMetadata = Commands.parseMessageMetadata(headersAndPayload);
                 headersAndPayload.resetReaderIndex();

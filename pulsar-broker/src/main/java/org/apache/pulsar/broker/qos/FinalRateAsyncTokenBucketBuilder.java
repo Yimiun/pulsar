@@ -23,13 +23,18 @@ package org.apache.pulsar.broker.qos;
  * A builder class for creating instances of {@link FinalRateAsyncTokenBucket}.
  */
 public class FinalRateAsyncTokenBucketBuilder
-        extends AsyncTokenBucketBuilder<FinalRateAsyncTokenBucketBuilder> {
+        extends AsyncTokenBucketBuilder<FinalRateAsyncTokenBucketBuilder, FinalRateAsyncTokenBucket> {
     protected Long capacity;
     protected Long initialTokens;
     protected Long rate;
     protected long ratePeriodNanos = AsyncTokenBucket.ONE_SECOND_NANOS;
 
     protected FinalRateAsyncTokenBucketBuilder() {
+    }
+
+    @Override
+    protected FinalRateAsyncTokenBucketBuilder self() {
+        return this;
     }
 
     public FinalRateAsyncTokenBucketBuilder rate(long rate) {
@@ -52,7 +57,7 @@ public class FinalRateAsyncTokenBucketBuilder
         return this;
     }
 
-    public AsyncTokenBucket build() {
+    public FinalRateAsyncTokenBucket build() {
         return new FinalRateAsyncTokenBucket(this.capacity != null ? this.capacity : this.rate, this.rate,
                 this.clock,
                 this.ratePeriodNanos, this.resolutionNanos,

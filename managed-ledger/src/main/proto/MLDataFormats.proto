@@ -113,6 +113,10 @@ message StringProperty {
 message ManagedCursorInfo {
     // If the ledger id is -1, then the mark-delete position is
     // the one from the (ledgerId, entryId) snapshot below
+    // 若-1，意味着正常关闭，MarkDeleted即为下次恢复的位置
+    // 若不是，意味着上次是kill/断电等强制关闭，意味着这有可能不是最新的，需要重放，同理MarkDeleted也不是最新的，需要从ledger重放恢复bitmap
+    // 这个ledger用于定时备份cursor快照信息，在正常关闭时，位置是-1
+    // 否则意味着出现了异常关闭，需要读取该ledger最后一条确认的信息，进行重放恢复，它包含了Ledger所有的有效信息（包括individualDeletedPosition），等同于正常关闭时zk中的信息。
     required int64 cursorsLedgerId = 1;
 
     // Last snapshot of the mark-delete position

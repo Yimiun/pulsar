@@ -129,7 +129,7 @@ public class BookkeeperSchemaStorage implements SchemaStorage {
 
     private void put(String key,
              Function<CompletableFuture<List<CompletableFuture<StoredSchema>>>,
-             CompletableFuture<Pair<byte[], byte[]>>> fn,
+                     CompletableFuture<Pair<byte[], byte[]>>> fn,
              CompletableFuture<SchemaVersion> promise) {
         CompletableFuture<Pair<Optional<LocatorEntry>, List<CompletableFuture<StoredSchema>>>> schemasWithLocator =
                 getAllWithLocator(key);

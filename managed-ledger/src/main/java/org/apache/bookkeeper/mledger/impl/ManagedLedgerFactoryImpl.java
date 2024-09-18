@@ -303,8 +303,8 @@ public class ManagedLedgerFactoryImpl implements ManagedLedgerFactory {
     public ManagedLedger open(String name, ManagedLedgerConfig config)
             throws InterruptedException, ManagedLedgerException {
         class Result {
-            ManagedLedger l = null;
-            ManagedLedgerException e = null;
+            volatile ManagedLedger l = null;
+            volatile ManagedLedgerException e = null;
         }
         final Result r = new Result();
         final CountDownLatch latch = new CountDownLatch(1);

@@ -19,6 +19,8 @@
 package org.apache.pulsar.broker.service.nonpersistent;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.pulsar.broker.service.AbstractDispatcherSingleActiveConsumer;
@@ -51,6 +53,7 @@ public final class NonPersistentDispatcherSingleActiveConsumer extends AbstractD
         this.redeliveryTracker = RedeliveryTrackerDisabled.REDELIVERY_TRACKER_DISABLED;
     }
 
+    private final AtomicInteger integer = new AtomicInteger();
     @Override
     public void sendMessages(List<Entry> entries) {
         Consumer currentConsumer = getActiveConsumer();
@@ -61,6 +64,7 @@ public final class NonPersistentDispatcherSingleActiveConsumer extends AbstractD
             currentConsumer.sendMessages(entries, batchSizes, null, sendMessageInfo.getTotalMessages(),
                     sendMessageInfo.getTotalBytes(), sendMessageInfo.getTotalChunkedMessages(), getRedeliveryTracker());
         } else {
+            System.out.println(integer.incrementAndGet());
             entries.forEach(entry -> {
                 int totalMsgs = Commands.getNumberOfMessagesInBatch(entry.getDataBuffer(), subscription.toString(), -1);
                 if (totalMsgs > 0) {

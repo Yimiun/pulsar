@@ -107,7 +107,7 @@ public class StreamingDataBlockHeaderImpl implements DataBlockHeader {
         if (dis.skip(toSkip) != toSkip) {
             throw new EOFException("Header was too small");
         }
-
+        dis.close();
         return new StreamingDataBlockHeaderImpl(headerLen, blockLen, ledgerId, firstEntryId);
     }
 

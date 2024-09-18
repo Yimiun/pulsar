@@ -84,6 +84,8 @@ final class ServerCnxThrottleTracker {
         }
     }
 
+    // 关闭某个Handler对应的Channel的AutoRead功能，减少流量
+    // 或开启某个Handler对应的Channel的AutoRead功能，开始接收
     private void changeAutoRead(boolean autoRead) {
         if (isChannelActive()) {
             if (log.isDebugEnabled()) {

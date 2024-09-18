@@ -81,14 +81,21 @@ public class ConcurrentOpenLongPairRangeSet<T extends Comparable<T>> implements 
         long lowerValue = lowerValueOpen + 1;
         if (lowerKey != upperKey) {
             // (1) set lower to last in lowerRange.getKey()
+            // 校验区间左侧的LedgerID:EntryID是否合法
             if (isValid(lowerKey, lowerValue)) {
+                // 试着拿到以前的，左区间LedgerId的覆盖区间，并更新
                 BitSet rangeBitSet = rangeBitSetMap.get(lowerKey);
                 // if lower and upper has different key/ledger then set ranges for lower-key only if
                 // a. bitSet already exist and given value is not the last value in the bitset.
                 // it will prevent setting up values which are not actually expected to set
                 // eg: (2:10..4:10] in this case, don't set any value for 2:10 and set [4:0..4:10]
+                // 若没有，就不更新了，因为根本不知道左区间的Ledger到底有多少个Entry，以及不知道左到右之间的Ledger是不是属于该ML的，所以
+                // 只能更新保准的右区间的左值为0；
+                // 如果有，那就取值，(rangeBitSet.previousSetBit(rangeBitSet.size())是找当前set中离右侧最近的那个值，也就是上次存的
+                // lastValue(lowerEntryID)
                 if (rangeBitSet != null && (rangeBitSet.previousSetBit(rangeBitSet.size()) > lowerValueOpen)) {
                     int lastValue = rangeBitSet.previousSetBit(rangeBitSet.size());
+                    // 其实就是保证不越上界(setSize)的情况下，set进去
                     rangeBitSet.set((int) lowerValue, (int) Math.max(lastValue, lowerValue) + 1);
                 }
             }
@@ -194,38 +201,90 @@ public class ConcurrentOpenLongPairRangeSet<T extends Comparable<T>> implements 
         forEach(action, consumer);
     }
 
+    /**
+     * LongPairConsumer顾名思义，消耗一组Pair数据，返回一个Position.
+     * 它的不同实现对应着是否池化对象的方式new,以节省空间.
+     * <p>该方法用于forEach每个LedgerId，每个forEach内部继续ForEach每个LedgerId的bitmap的连续1，详细解释看下面的方法
+     * forEachRawRange </p>
+     * */
     @Override
     public void forEach(RangeProcessor<T> action, LongPairConsumer<? extends T> consumerParam) {
-        forEachRawRange((lowerKey, lowerValue, upperKey, upperValue) -> {
-            Range<T> range = Range.openClosed(
-                    consumerParam.apply(lowerKey, lowerValue),
-                    consumerParam.apply(upperKey, upperValue)
-            );
-            return action.process(range);
-        });
-    }
-
-    @Override
-    public void forEachRawRange(RawRangeProcessor processor) {
+//        forEachRawRange((lowerKey, lowerValue, upperKey, upperValue) -> {
+//            Range<T> range = Range.openClosed(
+//                    consumerParam.apply(lowerKey, lowerValue),
+//                    consumerParam.apply(upperKey, upperValue)
+//            );
+//            return action.process(range);
+//        });
+        // 虽然理论上是可以选择new 两个PositionImpl对象，重用这两个的，而且比Netty的Recycler还要快，但是吧，这是common模块，不依赖于
+        // 任何模块，而且这个泛型还只规定了只能Comparable，也没法new 泛型对象，那既然如此，只能外部提供了。
+        // 这也说明了，泛型+lambda可以用于跨模块反向解决无依赖问题。
+        // 其实，这段代码也可以改成(RangeProcessor<T> action, T templateFrom, T templateEnd)
+        // 让外面传两个就行了，也可以起到一样的作用。
         AtomicBoolean completed = new AtomicBoolean(false);
-        rangeBitSetMap.forEach((key, set) -> {
+        rangeBitSetMap.forEach((ledgerId, ledgerMaskSet) -> {
             if (completed.get()) {
                 return;
             }
-            if (set.isEmpty()) {
+            if (ledgerMaskSet.isEmpty()) {
                 return;
             }
-            int first = set.nextSetBit(0);
-            int last = set.previousSetBit(set.size());
+            // 00001111110000110001111000
+            // 当前ledger，第一个1的位置(第一个ack的位置),即4
+            int first = ledgerMaskSet.nextSetBit(0);
+            // 当前ledger，最后一个1的位置（最后一个ack的位置）,即23
+            int last = ledgerMaskSet.previousSetBit(ledgerMaskSet.size());
             int currentClosedMark = first;
             while (currentClosedMark != -1 && currentClosedMark <= last) {
-                int nextOpenMark = set.nextClearBit(currentClosedMark);
-                if (!processor.processRawRange(key, currentClosedMark - 1,
-                        key, nextOpenMark - 1)) {
+                // 从currentClosedMark起下一个0的位置，它的前一位一定是1，这样(currentClosedMark-1, nextOpenMark-1]就是这段范围的ack
+                // 如第一次循环中，nextOpenMark为4的下一位0，即10，10-1=9，所以9肯定是这段1区间的右侧闭下标
+                int nextOpenMark = ledgerMaskSet.nextClearBit(currentClosedMark);
+                completed.set(!action.process(Range.openClosed(
+                            consumerParam.apply(ledgerId, currentClosedMark - 1),
+                            consumerParam.apply(ledgerId, nextOpenMark - 1))));
+                if (completed.get()) {
+                    break;
+                }
+                currentClosedMark = ledgerMaskSet.nextSetBit(nextOpenMark);
+            }
+        });
+    }
+
+    /**
+     * 该函数对每个跳表中的LedgerId对应的掩码Set进行了分段处理:
+     * <p>若当前ackSet为
+     * <code>00001111110000110001111000</code></p>
+     * 则下列函数相当于分别对以下区间做处理
+     * <p>(实际是得到左开右闭的四个下标给处理函数processor)
+     * <li>111111 (ledgerId, 3, ledgerId, 9]</li>
+     * <li>11 (ledgerId, 13, ledgerId, 15]</li>
+     * <li>1111 (ledgerId, 18, ledgerId, 22]</li>
+     * <p>若按序处理时任何一项返回了false，就停止处理</p>
+     * */
+    @Override
+    public void forEachRawRange(RawRangeProcessor processor) {
+        AtomicBoolean completed = new AtomicBoolean(false);
+        rangeBitSetMap.forEach((ledgerId, ledgerMaskSet) -> {
+            if (completed.get()) {
+                return;
+            }
+            if (ledgerMaskSet.isEmpty()) {
+                return;
+            }
+            // 当前ledger，第一个1的位置(第一个ack的位置)
+            int first = ledgerMaskSet.nextSetBit(0);
+            // 当前ledger，最后一个1的位置（最后一个ack的位置）
+            int last = ledgerMaskSet.previousSetBit(ledgerMaskSet.size());
+            int currentClosedMark = first;
+            while (currentClosedMark != -1 && currentClosedMark <= last) {
+                // 从currentClosedMark起下一个0的位置，它的前一位一定是1，这样(currentClosedMark-1, nextOpenMark-1]就是这段范围的ack
+                int nextOpenMark = ledgerMaskSet.nextClearBit(currentClosedMark);
+                if (!processor.processRawRange(ledgerId, currentClosedMark - 1,
+                        ledgerId, nextOpenMark - 1)) {
                     completed.set(true);
                     break;
                 }
-                currentClosedMark = set.nextSetBit(nextOpenMark);
+                currentClosedMark = ledgerMaskSet.nextSetBit(nextOpenMark);
             }
         });
     }

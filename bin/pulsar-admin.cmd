@@ -17,7 +17,7 @@
 @REM under the License.
 @REM
 
-@echo off
+
 
 for %%i in ("%~dp0.") do SET "SCRIPT_PATH=%%~fi"
 set "PULSAR_HOME_DIR=%SCRIPT_PATH%\..\"

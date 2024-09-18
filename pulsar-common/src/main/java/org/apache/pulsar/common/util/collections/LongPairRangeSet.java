@@ -143,7 +143,9 @@ public interface LongPairRangeSet<T extends Comparable<T>> {
 
     /**
      * Represents a function that accepts two long arguments and produces a result.
-     *
+     * <p>
+     *     LongPairConsumer顾名思义，消耗一组Pair数据，返回一个Position. 它的不同实现对应着是否池化对象的方式new,以节省空间.
+     * </p>
      * @param <T> the type of the result.
      */
     interface LongPairConsumer<T> {

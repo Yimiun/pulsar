@@ -65,7 +65,7 @@ public class DataBlockHeaderImpl implements DataBlockHeader {
         if (dis.skip(toSkip) != toSkip) {
             throw new EOFException("Header was too small");
         }
-
+        dis.close();
         return new DataBlockHeaderImpl(headerLen, blockLen, firstEntryId);
     }
 

@@ -23,6 +23,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
 import io.netty.util.ReferenceCountUtil;
+
+import java.lang.reflect.Field;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -36,6 +39,7 @@ import org.apache.bookkeeper.client.LedgerHandle;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.AddEntryCallback;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.Position;
+import org.apache.bookkeeper.mledger.ScanOutcome;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 
 
@@ -132,8 +136,17 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
     public void initiate() {
         if (STATE_UPDATER.compareAndSet(OpAddEntry.this, State.OPEN, State.INITIATED)) {
             ByteBuf duplicateBuffer = data.retainedDuplicate();
+            // retainDuplicate会复制一份bytebuf，但是底层的数组指向的还是老的那个,老的retain一次，+1，因此需要多释放一次。
+            // 但是创建的新buffer的readerIndex和writerIndex是新的，不是老的，可以保证传入一个黑盒方法后，不会影响老buffer的可读性与可写性，
+            // 不需要复杂的回调去重置index，因此这里采用复制的方式
+
+            // 这次retain其实也是保证传递给下一个线程的方法前，要retain一次，那个方法负责释放。
+            // netty中需要谁最后使用，谁就释放，每个黑盒方法不知道自己是不是最后使用这个buffer的，因此需要在最后释放。所以约定传入之前就retain一次。
 
             // internally asyncAddEntry() will take the ownership of the buffer and release it at the end
+            // bookie客户端的recyclePendAddOpObject方法会最终release一次
+            // pulsarDecoder的channelRead的finally块中会release一次
+            // 自己用完了还得release一次，在run方法里
             addOpCount = ManagedLedgerImpl.ADD_OP_COUNT_UPDATER.incrementAndGet(ml);
             lastInitTime = System.nanoTime();
             if (ml.getManagedLedgerInterceptor() != null) {
@@ -149,6 +162,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
                     }
                 }
             }
+            // 自己作为回调传入方法
             ledger.asyncAddEntry(duplicateBuffer, this, addOpCount);
         } else {
             log.warn("[{}] initiate with unexpected state {}, expect OPEN state.", ml.getName(), state);
@@ -180,6 +194,8 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
     }
 
     @Override
+    // rc r什么code,标识码
+    // ledgerHandle
     public void addComplete(int rc, final LedgerHandle lh, long entryId, Object ctx) {
         if (!STATE_UPDATER.compareAndSet(OpAddEntry.this, State.INITIATED, State.COMPLETED)) {
             log.warn("[{}] The add op is terminal legacy callback for entry {}-{} adding.", ml.getName(), lh.getId(),
@@ -211,14 +227,19 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         }
 
         if (rc != BKException.Code.OK || timeoutTriggered.get()) {
+            // 若这是最后一条，处于切换状态，发送失败了，怎么处理？
+            // 答：不用处理，若普通写入失败就直接关闭，触发重建重发逻辑，这个逻辑和最后一条的逻辑是一致的，都需要关闭当前写入的ledger，并且触发重建重发逻辑，
+            // 因此 handleAddFailure里的ml.ledgerClosed(lh) 就可以认为是触发真正关闭，重发重建的唯一方法（况且名字就意味了一切2333）
             handleAddFailure(lh);
         } else {
             // Trigger addComplete callback in a thread hashed on the managed ledger name
+            // 调用ml里的单线程执行run方法，相当于结束后的回调也全都用那个单线程执行，避免潜在问题。
             ml.getExecutor().execute(this);
         }
     }
 
     // Called in executor hashed on managed ledger name, once the add operation is complete
+    // 单线程，一旦持久化写入到ledger后就执行
     @Override
     public void run() {
         if (payloadProcessorHandle != null) {
@@ -230,6 +251,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
             return;
         }
         if (this != firstInQueue) {
+            // 由于添加到该队列的线程也是那个线程，因此消息会严格按顺序写入，每次从队列头部取出的一定是刚刚持久化的那一条，这种情况不是预期内的
             firstInQueue.failed(new ManagedLedgerException("Unexpected add entry op when complete the add entry op."));
             return;
         }
@@ -238,11 +260,12 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         ManagedLedgerImpl.TOTAL_SIZE_UPDATER.addAndGet(ml, dataLength);
 
         long ledgerId = ledger != null ? ledger.getId() : ((Position) ctx).getLedgerId();
+        // 应该是用于看有没有活跃消费者的，有就直接转发给消费者，省一次磁盘IO
         if (ml.hasActiveCursors()) {
             // Avoid caching entries if no cursor has been created
             EntryImpl entry = EntryImpl.create(ledgerId, entryId, data);
-            // EntryCache.insert: duplicates entry by allocating new entry and data. so, recycle entry after calling
-            // insert
+            // EntryCache.insert: duplicates entry by allocating new entry and data. so,
+            // recycle entry after calling insert
             ml.entryCache.insert(entry);
             entry.release();
         }
@@ -251,6 +274,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         ManagedLedgerImpl.ENTRIES_ADDED_COUNTER_UPDATER.incrementAndGet(ml);
         ml.lastConfirmedEntry = lastEntry;
 
+        // 之前那个在是否切换ledger时set进去的属性，如果是true，意味着当前这个写完要切换ledger了
         if (closeWhenDone) {
             log.info("[{}] Closing ledger {} for being full", ml.getName(), ledgerId);
             // `data` will be released in `closeComplete`
@@ -262,9 +286,11 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
             AddEntryCallback cb = callbackUpdater.getAndSet(this, null);
             if (cb != null) {
                 cb.addComplete(lastEntry, data.asReadOnly(), ctx);
+                // 提醒资源准备好了
                 ml.notifyCursors();
                 ml.notifyWaitingEntryCallBacks();
                 ReferenceCountUtil.release(data);
+                // 执行pulsar包装的bk线程的回收 rnf再次-1（上一次是在bookie发送的客户端中，class类封装的发送方法会减一）
                 this.recycle();
             } else {
                 ReferenceCountUtil.release(data);
@@ -272,6 +298,8 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         }
     }
 
+    // closeLedger的回调函数，若当前消息是当前ledger的最后一条消息，会在消息成功写入的回调中调用ledger.asyncClose(this, ctx); 触发回调
+    // 这个callback是由metadata-store线程池触发的，是zk的元数据线程
     @Override
     public void closeComplete(int rc, LedgerHandle lh, Object ctx) {
         checkArgument(ledger.getId() == lh.getId(), "ledgerId %s doesn't match with acked ledgerId %s", ledger.getId(),
@@ -286,6 +314,8 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         ml.ledgerClosed(lh);
         updateLatency();
 
+        // 这条消息是当前ledger的最后一条了，发送成功了，且状态是closewhendown（managed-ledger切换，处于closingLedger状态）才会调用到本方法
+        // 因此这条消息的后续处理和正常的发送成功是一样的。
         AddEntryCallback cb = callbackUpdater.getAndSet(this, null);
         if (cb != null) {
             cb.addComplete(PositionImpl.get(lh.getId(), entryId), data.asReadOnly(), ctx);
@@ -332,6 +362,8 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable {
         finalMl.getExecutor().execute(() -> {
             // Force the creation of a new ledger. Doing it in a background thread to avoid acquiring ML lock
             // from a BK callback.
+            // 若在ml回调的线程里请求ml锁， 则有可能出现死锁（？），该回调线程负责处理该managed-ledger的回调数据，但是又在当前上下文请求锁
+            // 保底也是一个性能损耗
             finalMl.ledgerClosed(lh);
         });
     }

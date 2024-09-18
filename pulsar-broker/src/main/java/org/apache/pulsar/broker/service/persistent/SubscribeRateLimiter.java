@@ -93,6 +93,7 @@ public class SubscribeRateLimiter {
      * namespace-policy configured subscribe rate else applies
      * default broker subscribe-throttling-rate
      */
+    // 同步防止重复添加/已经删除，保证语义原子性
     private synchronized void addSubscribeLimiterIfAbsent(ConsumerIdentifier consumerIdentifier) {
         if (subscribeRateLimiter.get(consumerIdentifier) != null || !isSubscribeRateEnabled(this.subscribeRate)) {
             return;

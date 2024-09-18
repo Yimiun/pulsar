@@ -56,6 +56,7 @@ public abstract class AsyncTokenBucket {
     // The default resolution is 16 milliseconds. This means that the consumed tokens are subtracted from the
     // current amount of tokens about every 16 milliseconds. This solution helps prevent a CAS loop what could cause
     // extra CPU usage when a single CAS field is updated at a high rate from multiple threads.
+    // 默认16毫秒判定一次，防止CPU都在无意义的忙CAS;
     static long defaultResolutionNanos = DEFAULT_RESOLUTION_NANOS;
 
     // used in tests to disable the optimization and instead use a consistent view of the tokens
@@ -158,17 +159,17 @@ public abstract class AsyncTokenBucket {
         // check if the tokens should be updated immediately
         if (shouldUpdateTokensImmediately(currentNanos, forceUpdateTokens)) {
             // calculate the number of new tokens since the last update
+            // 懒处理，当消耗的时候再计算增量
             long newTokens = calculateNewTokensSinceLastUpdate(currentNanos);
             // calculate the total amount of tokens to consume in this update
             // flush the pendingConsumedTokens by calling "sumThenReset"
+            // 把上次不需要及时更新的也加到本次更新里
             long totalConsumedTokens = consumeTokens + pendingConsumedTokens.sumThenReset();
             // update the tokens and return the current token value
             return TOKENS_UPDATER.updateAndGet(this,
                     currentTokens ->
                             // after adding new tokens, limit the tokens to the capacity
-                            Math.min(currentTokens + newTokens, getCapacity())
-                                    // subtract the consumed tokens
-                                    - totalConsumedTokens);
+                            Math.min(currentTokens + newTokens, getCapacity()) - totalConsumedTokens);
         } else {
             // eventual consistent fast path, tokens are not updated immediately
 
@@ -205,23 +206,33 @@ public abstract class AsyncTokenBucket {
     /**
      * Calculate the number of new tokens since the last update.
      * This will carry forward the remainder nanos so that a possible rounding error is eliminated.
-     *
+     * <p>传一个当前纳秒，返回这段时间该产生的令牌数量
      * @param currentNanos the current monotonic clock time in nanoseconds
      * @return the number of new tokens to add since the last update
      */
     private long calculateNewTokensSinceLastUpdate(long currentNanos) {
         long newTokens;
+        // 上次生成令牌的纳秒值
         long previousLastNanos = LAST_NANOS_UPDATER.getAndSet(this, currentNanos);
         if (previousLastNanos == 0) {
+            // 初始化
             newTokens = 0;
         } else {
+            // 获取上次生产令牌时，未结余的那部分四舍五入令牌对应的时间，加上上次与这次的时间间隔
+            // 令牌数量 = 间隔时间/令牌生产周期固定纳秒数 * 每个周期的生产数量
+            // newTokens = durationNanos/currentRatePeriodNanos * currentRate;
+            // 由于存在除法舍去的情况，因此相当于:
+            // (durationNanos - (durationNanos % currentRatePeriodNano))/currentRatePeriodNanos * currentRate
+            // 这部分没纳入统计的 余数/currentRatePeriodNanos，会积少成多，导致最终数值不准确，因此每次计算需要把这个额外保存，使用REMAINDER
             long durationNanos = currentNanos - previousLastNanos + REMAINDER_NANOS_UPDATER.getAndSet(this, 0);
             long currentRate = getRate();
             long currentRatePeriodNanos = getRatePeriodNanos();
             // new tokens is the amount of tokens that are created in the duration since the last update
             // with the configured rate
+            // 算当前时间差能产生多少令牌，向下取整
             newTokens = (durationNanos * currentRate) / currentRatePeriodNanos;
             // carry forward the remainder nanos so that the rounding error is eliminated
+            // 算余数对应的舍去的那部分纳秒
             long remainderNanos = durationNanos - ((newTokens * currentRatePeriodNanos) / currentRate);
             if (remainderNanos > 0) {
                 REMAINDER_NANOS_UPDATER.addAndGet(this, remainderNanos);

@@ -46,20 +46,13 @@ import io.netty.util.concurrent.ScheduledFuture;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.IdentityHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.naming.AuthenticationException;
 import javax.net.ssl.SSLSession;
@@ -213,6 +206,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
 
     // Max number of pending requests per connections. If multiple producers are sharing the same connection the flow
     // control done by a single producer might not be enough to prevent write spikes on the broker.
+    // 防止客户端使用同个client里new了多个线程，里面又new了大量的生产者，那么他们都公用这个连接，这种情况下生产者本身的限流器就没法削峰了
     private final int maxPendingSendRequests;
     private final int resumeReadsThreshold;
     private int pendingSendRequest = 0;
@@ -276,6 +270,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
             // we resume all connections sharing the same thread
             if (limitExceeded && pendingBytes <= resumeThresholdPendingBytesPerThread) {
                 limitExceeded = false;
+                // 直接阻塞该线程的所有cnx()
                 cnxsPerThread.get().forEach(cnx -> cnx.throttleTracker.setPublishBufferLimiting(false));
             }
         }
@@ -1312,9 +1307,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                 }
 
                 service.isAllowAutoTopicCreationAsync(topicName.toString())
-                        .thenApply(isAllowed -> forceTopicCreation && isAllowed)
-                        .thenCompose(createTopicIfDoesNotExist ->
-                                service.getTopic(topicName.toString(), createTopicIfDoesNotExist))
+                        .thenCompose(isAllowed ->
+                                service.getTopic(topicName.toString(), forceTopicCreation && isAllowed))
                         .thenCompose(optTopic -> {
                             if (!optTopic.isPresent()) {
                                 return FutureUtil
@@ -1862,20 +1856,21 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
 
         // New messages are silently ignored during topic transfer. Note that the transferring flag is only set when the
         // Extensible Load Manager is enabled.
+        // 记录分区转移时，卸载分区时忽略的消息数量，不知道干啥用的
         if (producer.getTopic().isTransferring()) {
             var pulsar = getBrokerService().pulsar();
             var ignoredMsgCount = send.getNumMessages();
             var ignoredSendMsgTotalCount = ExtensibleLoadManagerImpl.get(pulsar).getIgnoredSendMsgCount().
                     addAndGet(ignoredMsgCount);
             if (log.isDebugEnabled()) {
-                log.debug("Ignoring {} messages from:{}:{} to fenced topic:{} while transferring."
+                log.info("Ignoring {} messages from:{}:{} to fenced topic:{} while transferring."
                                 + " Total ignored message count: {}.",
                         ignoredMsgCount, remoteAddress, send.getProducerId(), producer.getTopic().getName(),
                         ignoredSendMsgTotalCount);
             }
             return;
         }
-
+        // 绝对线程安全
         if (producer.isNonPersistentTopic()) {
             // avoid processing non-persist message if reached max concurrent-message limit
             if (nonPersistentPendingMessages > maxNonPersistentPendingMessages) {
@@ -1892,6 +1887,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
             }
         }
 
+        //
         increasePendingSendRequestsAndPublishBytes(headersAndPayload.readableBytes());
 
         if (send.hasTxnidMostBits() && send.hasTxnidLeastBits()) {
@@ -1986,6 +1982,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         }
     }
 
+    // 推动消费者进行消费
     @Override
     protected void handleFlow(CommandFlow flow) {
         checkArgument(state == State.Connected);
@@ -3296,9 +3293,11 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
     // handle throttling based on pending send requests in the same connection
     // or the pending publish bytes
     private void increasePendingSendRequestsAndPublishBytes(int msgSize) {
+        // 若当前工作线程的当前Cnx挂起请求过多，必须限制当前Cnx的流量
         if (++pendingSendRequest == maxPendingSendRequests) {
             throttleTracker.setPendingSendRequestsExceeded(true);
         }
+        // 计算当前线程的吞吐量，若过多，则关闭所有绑定的Cnx的AutoRead功能
         PendingBytesPerThreadTracker.getInstance().incrementPublishBytes(msgSize, maxPendingBytesPerThread);
     }
 

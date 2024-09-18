@@ -147,7 +147,8 @@ public class ProcessRuntimeFactory implements RuntimeFactory {
                         + " using the location defined in system environment : {}", envJavaInstanceJarLocation);
                 this.javaInstanceJarFile = envJavaInstanceJarLocation;
             } else {
-                throw new RuntimeException("No JavaInstanceJar specified");
+                this.javaInstanceJarFile = "./functions";
+//                throw new RuntimeException("No JavaInstanceJar specified");
             }
         }
 
@@ -158,7 +159,8 @@ public class ProcessRuntimeFactory implements RuntimeFactory {
                         + " using the location defined in system environment : {}", envPythonInstanceLocation);
                 this.pythonInstanceFile = envPythonInstanceLocation;
             } else {
-                throw new RuntimeException("No PythonInstanceFile specified");
+                this.pythonInstanceFile = "./python";
+//                throw new RuntimeException("No PythonInstanceFile specified");
             }
         }
 

@@ -25,7 +25,7 @@ import java.util.function.LongSupplier;
  * A builder class for creating instances of {@link DynamicRateAsyncTokenBucket}.
  */
 public class DynamicRateAsyncTokenBucketBuilder
-        extends AsyncTokenBucketBuilder<DynamicRateAsyncTokenBucketBuilder> {
+        extends AsyncTokenBucketBuilder<DynamicRateAsyncTokenBucketBuilder, DynamicRateAsyncTokenBucket> {
     protected LongSupplier rateFunction;
     protected double capacityFactor = 1.0d;
     protected double initialFillFactor = 1.0d;
@@ -33,6 +33,11 @@ public class DynamicRateAsyncTokenBucketBuilder
     protected double targetFillFactorAfterThrottling = 0.01d;
 
     protected DynamicRateAsyncTokenBucketBuilder() {
+    }
+
+    @Override
+    protected DynamicRateAsyncTokenBucketBuilder self() {
+        return this;
     }
 
     public DynamicRateAsyncTokenBucketBuilder rateFunction(LongSupplier rateFunction) {
@@ -62,7 +67,7 @@ public class DynamicRateAsyncTokenBucketBuilder
     }
 
     @Override
-    public AsyncTokenBucket build() {
+    public DynamicRateAsyncTokenBucket build() {
         return new DynamicRateAsyncTokenBucket(this.capacityFactor, this.rateFunction,
                 this.clock,
                 this.ratePeriodNanosFunction, this.resolutionNanos,

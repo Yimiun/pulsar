@@ -264,7 +264,7 @@ public class ServiceConfiguration implements PulsarConfiguration {
             "Add detailed client/remote and server/local addresses and ports to http/https request logging.\n"
                     + "Defaults to true when either webServiceHaProxyProtocolEnabled or webServiceTrustXForwardedFor "
                     + "is enabled.")
-    private Boolean webServiceLogDetailedAddresses;
+    private Boolean webServiceLogDetailedAddresses = true;
 
     @FieldContext(
             category = CATEGORY_SERVER,
@@ -1231,7 +1231,7 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(
         category = CATEGORY_SERVER,
         doc = "Max concurrent non-persistent message can be processed per connection")
-    private int maxConcurrentNonPersistentMessagePerConnection = 1000;
+    private int maxConcurrentNonPersistentMessagePerConnection = 1000000;
 
     @Deprecated
     @FieldContext(

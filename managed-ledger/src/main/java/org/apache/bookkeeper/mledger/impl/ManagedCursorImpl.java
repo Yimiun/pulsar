@@ -98,6 +98,7 @@ import org.apache.bookkeeper.mledger.proto.MLDataFormats.StringProperty;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.collections.BitSetRecyclable;
+import org.apache.pulsar.common.util.collections.ConcurrentOpenLongPairRangeSet;
 import org.apache.pulsar.common.util.collections.LongPairRangeSet;
 import org.apache.pulsar.common.util.collections.LongPairRangeSet.LongPairConsumer;
 import org.apache.pulsar.common.util.collections.LongPairRangeSet.RangeBoundConsumer;
@@ -127,6 +128,7 @@ public class ManagedCursorImpl implements ManagedCursor {
     private volatile Map<String, String> cursorProperties;
     private final BookKeeper.DigestType digestType;
 
+    // 最早的可删除位点，意味着这之前的所有消息都被ack了
     protected volatile PositionImpl markDeletePosition;
 
     // this position is have persistent mark delete position
@@ -169,6 +171,7 @@ public class ManagedCursorImpl implements ManagedCursor {
     // This counters are used to compute the numberOfEntries and numberOfEntriesInBacklog values, without having to look
     // at the list of ledgers in the ml. They are initialized to (-backlog) at opening, and will be incremented each
     // time a message is read or deleted.
+    // 初始化的时候会是负的，backlogEntry的数量
     protected volatile long messagesConsumedCounter;
 
     // Current ledger used to append the mark-delete position
@@ -195,11 +198,14 @@ public class ManagedCursorImpl implements ManagedCursor {
         position.ackSet = null;
         return position;
     };
+    // ack mask set
+    // 一个利用bitmap实现的数据结构，每个数据项是 Ledger -> BitMap(AckMap)，存入的标志1意味着该消息已经被消费
     protected final RangeSetWrapper<PositionImpl> individualDeletedMessages;
 
     // Maintain the deletion status for batch messages
     // (ledgerId, entryId) -> deletion indexes
     protected final ConcurrentSkipListMap<PositionImpl, BitSetRecyclable> batchDeletedIndexes;
+    // Range专用读写锁
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
     private RateLimiter markDeleteLimiter;
@@ -468,6 +474,9 @@ public class ManagedCursorImpl implements ManagedCursor {
     /**
      * Performs the initial recovery, reading the mark-deleted position from the ledger and then calling initialize to
      * have a new opened ledger.
+     * <p>
+     * 只发生在ml初始化阶段，因此不会有trimLedger发生，不用担心在恢复cursor的ledger信息时，部分ledger被trimDelete的情况
+     * 这种情况需要在运行态创建时纳入考虑并使用同步.
      */
     void recover(final VoidCallback callback) {
         // Read the meta-data ledgerId from the store
@@ -476,11 +485,11 @@ public class ManagedCursorImpl implements ManagedCursor {
             @Override
             public void operationComplete(ManagedCursorInfo info, Stat stat) {
                 updateCursorLedgerStat(info, stat);
-
+                log.info("ManagedCursorInfo is : {}", info);
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] [{}] Recover cursor last active to [{}]", ledger.getName(), name, lastActive);
                 }
-
+                // zk里读到的游标属性
                 Map<String, String> recoveredCursorProperties = Collections.emptyMap();
                 if (info.getCursorPropertiesCount() > 0) {
                     // Recover properties map
@@ -491,12 +500,15 @@ public class ManagedCursorImpl implements ManagedCursor {
                     }
                 }
                 cursorProperties = recoveredCursorProperties;
-
+                // cursor是保存在ledger里的，也要从ledger里读消息
                 if (info.getCursorsLedgerId() == -1L) {
                     // There is no cursor ledger to read the last position from. It means the cursor has been properly
                     // closed and the last mark-delete position is stored in the ManagedCursorInfo itself.
+                    // 正常关闭时，会把markDelete信息更新到zk的节点里，并且把这个ledgerId置为-1，因此可以无脑从markDelete来恢复，
+                    // 这个markDelete实际上记录的就是当前订阅最早的未确认消息，从这一条往后开始恢复即可。
                     PositionImpl recoveredPosition = new PositionImpl(info.getMarkDeleteLedgerId(),
                             info.getMarkDeleteEntryId());
+                    // 恢复各个ML中的ledger的ack掩码到内存的individualDeletedMap里，
                     if (info.getIndividualDeletedMessagesCount() > 0) {
                         recoverIndividualDeletedMessages(info.getIndividualDeletedMessagesList());
                     }
@@ -510,13 +522,15 @@ public class ManagedCursorImpl implements ManagedCursor {
                             recoveredProperties.put(property.getName(), property.getValue());
                         }
                     }
-
+                    // 使用MarkDeleted作为CursorsLedger，标志该Cursor目前处于启用状态，从而维护最开始判断的一致性。即启用时不是-1，因而因意外
+                    // 关闭时仍旧不是-1，但是正常关闭时是-1
                     recoveredCursor(recoveredPosition, recoveredProperties, recoveredCursorProperties, null);
                     callback.operationComplete();
                 } else {
                     // Need to proceed and read the last entry in the specified ledger to find out the last position
                     log.info("[{}] Cursor {} meta-data recover from ledger {}", ledger.getName(), name,
                             info.getCursorsLedgerId());
+                    // 异常关闭，需要重放ledger信息，得到last position，从而进行和上面一样的操作
                     recoverFromLedger(info, callback);
                 }
             }
@@ -533,6 +547,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         // a new ledger and write the position into it
         ledger.mbean.startCursorLedgerOpenOp();
         long ledgerId = info.getCursorsLedgerId();
+        // 获取最后标记的ledgerId，重放信息
         OpenCallback openCallback = (rc, lh, ctx) -> {
             if (log.isInfoEnabled()) {
                 log.info("[{}] Opened ledger {} for cursor {}. rc={}", ledger.getName(), ledgerId, name, rc);
@@ -540,7 +555,7 @@ public class ManagedCursorImpl implements ManagedCursor {
             if (isBkErrorNotRecoverable(rc)) {
                 log.error("[{}] Error opening metadata ledger {} for cursor {}: {}", ledger.getName(), ledgerId, name,
                         BKException.getMessage(rc));
-                // Rewind to oldest entry available
+                // Rewind to the oldest entry available
                 initialize(getRollbackPosition(info), Collections.emptyMap(), cursorProperties, callback);
                 return;
             } else if (rc != BKException.Code.OK) {
@@ -551,6 +566,7 @@ public class ManagedCursorImpl implements ManagedCursor {
             }
 
             // Read the last entry in the ledger
+            // 读CursorLedger的最后一条消息，这个就是最后的快照，按照这条恢复就行
             long lastEntryInLedger = lh.getLastAddConfirmed();
 
             if (lastEntryInLedger < 0) {
@@ -568,7 +584,7 @@ public class ManagedCursorImpl implements ManagedCursor {
                 if (isBkErrorNotRecoverable(rc1)) {
                     log.error("[{}] Error reading from metadata ledger {} for cursor {}: {}", ledger.getName(),
                             ledgerId, name, BKException.getMessage(rc1));
-                    // Rewind to oldest entry available
+                    // Rewind to the oldest entry available
                     initialize(getRollbackPosition(info), Collections.emptyMap(), cursorProperties, callback);
                     return;
                 } else if (rc1 != BKException.Code.OK) {
@@ -621,11 +637,25 @@ public class ManagedCursorImpl implements ManagedCursor {
         }
     }
 
+    /**
+     * <p>根据zk里合并过的AckRange调用遍历，让每个AckRange拆开成Ledger->AckBitMap的格式，如：其中一个messageRange
+     * 若为(2:102,  105:11]，意味着这个范围内所有的数据全都被ack了，因此要从ML中恢复，只恢复ML中保存的可读Ledger，
+     * 这一项可能会被恢复成如下格式，并都插入到individualDeletedMessages中:</p>
+     * <ul>
+     *     <li>(LedgerId 2, Range (2:102 - 2:999]) </li>
+     *     <li>(LedgerId 4, Range (4:-1 - 4:9999]) </li>
+     *     <li>(LedgerId 37, Range (37:-1 - 37:7777]) </li>
+     *     <li>(LedgerId 92, Range (92:-1 - 92:6666]) </li>
+     *     <li>(LedgerId 105, Range (105:-1 - 105:11]) </li>
+     * </ul>
+     * 这几项都代表着持久化的ack的范围集合
+     * */
     private void recoverIndividualDeletedMessages(List<MLDataFormats.MessageRange> individualDeletedMessagesList) {
         lock.writeLock().lock();
         try {
             individualDeletedMessages.clear();
             individualDeletedMessagesList.forEach(messageRange -> {
+                // (lowerEndpoint, upperEndpoint]
                 MLDataFormats.NestedPositionInfo lowerEndpoint = messageRange.getLowerEndpoint();
                 MLDataFormats.NestedPositionInfo upperEndpoint = messageRange.getUpperEndpoint();
 
@@ -633,7 +663,9 @@ public class ManagedCursorImpl implements ManagedCursor {
                     individualDeletedMessages.addOpenClosed(lowerEndpoint.getLedgerId(), lowerEndpoint.getEntryId(),
                             upperEndpoint.getLedgerId(), upperEndpoint.getEntryId());
                 } else {
-                    // Store message ranges after splitting them by ledger ID
+                    // 根据LedgerId分批次存储，最老的和最新的关乎到更新左区间和右区间，因此单独拿出来，其余的for循环即可
+                    // 由于individualDeletedMessagesList本身就代表着已经ACK的消息，如(2:102,  105:-1]
+                    // 代表着这期间所有的ledger:entry都被确认了，因此中间的所有出现的ledger，都可以认为全都是ack的，所以可以这样操作
                     LedgerInfo lowerEndpointLedgerInfo = ledger.getLedgersInfo().get(lowerEndpoint.getLedgerId());
                     if (lowerEndpointLedgerInfo != null) {
                         individualDeletedMessages.addOpenClosed(lowerEndpoint.getLedgerId(), lowerEndpoint.getEntryId(),
@@ -678,11 +710,15 @@ public class ManagedCursorImpl implements ManagedCursor {
         }
     }
 
+    // 根据之前读取到的持久化信息，恢复内存信息
+    // 这里的position正常情况下是MarkDeletedPosition
     private void recoveredCursor(PositionImpl position, Map<String, Long> properties,
                                  Map<String, String> cursorProperties,
                                  LedgerHandle recoveredFromCursorLedger) {
         // if the position was at a ledger that didn't exist (since it will be deleted if it was previously empty),
         // we need to move to the next existing ledger
+        // 若该markDelete位置已经被删了，则直接跳到下一个位置，要是一个可用Ledger都没有了，那无所谓了。
+        // 不过这是不可能的，因为在恢复之前已经create了一个新的ledger用于写入
         if (position.getEntryId() == -1L && !ledger.ledgerExists(position.getLedgerId())) {
             Long nextExistingLedger = ledger.getNextValidLedger(position.getLedgerId());
             if (nextExistingLedger == null) {
@@ -691,6 +727,8 @@ public class ManagedCursorImpl implements ManagedCursor {
             }
             position = nextExistingLedger != null ? PositionImpl.get(nextExistingLedger, -1) : position;
         }
+        // 这种情况也可能会出现，MarkDelete的位置处于旧Ledger和新Ledger之间，看起来不太会出现，也许会偶发吧，会有这种场景的，详情看commit历史
+        // 保证鲁棒性
         if (position.compareTo(ledger.getLastPosition()) > 0) {
             log.warn("[{}] [{}] Current position {} is ahead of last position {}", ledger.getName(), name, position,
                     ledger.getLastPosition());
@@ -698,6 +736,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         }
         log.info("[{}] Cursor {} recovered to position {}", ledger.getName(), name, position);
         this.cursorProperties = cursorProperties == null ? Collections.emptyMap() : cursorProperties;
+        // 得到MarkDeleted到最新消息这段区间的BackLog(Ledger消息size - individualDeletedMap中1的总数)，并取负
         messagesConsumedCounter = -getNumberOfEntries(Range.openClosed(position, ledger.getLastPosition()));
         markDeletePosition = position;
         persistentMarkDeletePosition = position;
@@ -711,6 +750,9 @@ public class ManagedCursorImpl implements ManagedCursor {
         STATE_UPDATER.set(this, State.NoLedger);
     }
 
+    // 根据一个位置恢复游标，这个位置大概率并不是上次关闭前的位置，这个方法也一般是异常关闭的恢复才调用的，且是无法恢复的异常调用的。
+    // 因此它需要将一个稳定合法的（一般是topic级别的最早位置/zk记录的上次markDelete位置）位置再次更新到zk。
+    // 因为它会多一步更新zk的步骤，因此也可以用于ml的创建cursor方法。
     void initialize(PositionImpl position, Map<String, Long> properties, Map<String, String> cursorProperties,
                     final VoidCallback callback) {
         recoveredCursor(position, properties, cursorProperties, null);
@@ -1569,23 +1611,38 @@ public class ManagedCursorImpl implements ManagedCursor {
         return alreadyAcknowledgedPositions;
     }
 
+    /**
+     * 该方法用于得到给定范围内所有UnAck的数量.
+     * */
+    // 恢复阶段：传入的是[MarkDeleted, LastConfirmed]，allEntries相当这个range的entries
     protected long getNumberOfEntries(Range<PositionImpl> range) {
+        // 区域entries总数
         long allEntries = ledger.getNumberOfEntries(range);
 
         if (log.isDebugEnabled()) {
             log.debug("[{}] getNumberOfEntries. {} allEntries: {}", ledger.getName(), range, allEntries);
         }
 
+        // 用于统计区域中ack的entries的数量
         AtomicLong deletedEntries = new AtomicLong(0);
-
+        // Read only访问RangeWrapper的读锁
         lock.readLock().lock();
         try {
+            // 直接减去所有的ack条目
             if (getConfig().isUnackedRangesOpenCacheSetEnabled()) {
+                // 统计所有在此区间为1的条目数量，意味着此区间的ack数量
                 int cardinality = individualDeletedMessages.cardinality(
                         range.lowerEndpoint().ledgerId, range.lowerEndpoint().entryId,
                         range.upperEndpoint().ledgerId, range.upperEndpoint().entryId);
                 deletedEntries.addAndGet(cardinality);
             } else {
+                // forEach方法的实现很有意思，十分推荐点进去看，总结就是：
+                // 对这个individualDeletedMessages底层的跳表调用forEach，对跳表的每一项LedgerAckMaskBitSet(我喜欢这么称呼)
+                // 继续分割成连续1的子序列Range r，忽略0，对这个r调用下面的lambda表达式
+                // 这里的r的构建使用的是recyclePositionRangeConverter函数，构建了一个Recycler，因此需要finally回收
+                // 下面的表达式实际上就是将此1序列与传进来的range进行交集，求交集大小，即为r这一段的ack的数量
+                // @see org.apache.pulsar.common.util.collections.ConcurrentOpenLongPairRangeSet#forEach()
+                // 究其原因是，bitmap没有直接的交集方法
                 individualDeletedMessages.forEach((r) -> {
                     try {
                         if (r.isConnected(range)) {
@@ -1599,6 +1656,7 @@ public class ManagedCursorImpl implements ManagedCursor {
                         }
                         return true;
                     } finally {
+                        // 回收Function中consumerParam提供的Recycler对象
                         if (r.lowerEndpoint() instanceof PositionImplRecyclable) {
                             ((PositionImplRecyclable) r.lowerEndpoint()).recycle();
                             ((PositionImplRecyclable) r.upperEndpoint()).recycle();
@@ -1941,7 +1999,7 @@ public class ManagedCursorImpl implements ManagedCursor {
                     .CursorAlreadyClosedException("Cursor was already closed"), ctx);
             return;
         }
-
+        // 防止此时有人在reset cursor，重置游标位置
         if (RESET_CURSOR_IN_PROGRESS_UPDATER.get(this) == TRUE) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] cursor reset in progress - ignoring mark delete on position [{}] for cursor [{}]",

@@ -1545,6 +1545,7 @@ public class BrokerService implements Closeable {
 
         checkTopicNsOwnership(topic)
                 .thenRun(() -> {
+                    // 只有n个线程能真的去创建Topic，其他的放在等待队列里，限制并发量
                     final Semaphore topicLoadSemaphore = topicLoadRequestSemaphore.get();
 
                     if (topicLoadSemaphore.tryAcquire()) {
@@ -1708,7 +1709,6 @@ public class BrokerService implements Closeable {
                     loadFuture.completeExceptionally(ex);
                 }
             });
-
             if (createIfMissing) {
                 topicEventsDispatcher.notify(topic, TopicEvent.CREATE, EventStage.BEFORE);
                 topicEventsDispatcher.notifyOnCompletion(topicFuture, topic, TopicEvent.CREATE);
@@ -1716,6 +1716,7 @@ public class BrokerService implements Closeable {
             topicEventsDispatcher.notifyOnCompletion(loadFuture, topic, TopicEvent.LOAD);
 
             // Once we have the configuration, we can proceed with the async open operation
+            // 打开后执行到成功的回调，意味着已经初始化了managedLedger所需要的所有ledger信息，以及cursors的信息。
             managedLedgerFactory.asyncOpen(topicName.getPersistenceNamingEncoding(), managedLedgerConfig,
                     new OpenLedgerCallback() {
                         @Override

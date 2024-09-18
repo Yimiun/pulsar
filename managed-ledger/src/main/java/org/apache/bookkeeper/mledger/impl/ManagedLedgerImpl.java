@@ -33,20 +33,7 @@ import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
 import java.io.IOException;
 import java.time.Clock;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.NavigableMap;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Queue;
-import java.util.Random;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -149,6 +136,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     protected static final int AsyncOperationTimeoutSeconds = 30;
 
+    // 这个managed-ledger被open的时候根据配置初始化的bk客户端
     protected final BookKeeper bookKeeper;
     protected final String name;
     private final Map<String, byte[]> ledgerMetadata;
@@ -163,6 +151,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     .expectedItems(16) // initial capacity
                     .concurrencyLevel(1) // number of sections
                     .build();
+
+    // 拥有当前所有未消费订阅的信息对应的ledger信息集合，可通过bk客户端成员变量访问
     protected final NavigableMap<Long, LedgerInfo> ledgers = new ConcurrentSkipListMap<>();
     protected volatile Stat ledgersStat;
 
@@ -208,6 +198,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     /**
      * This lock is held while the ledgers list or propertiesMap is updated asynchronously on the metadata store.
      * Since we use the store version, we cannot have multiple concurrent updates.
+     * 和我的想法还就那个完全一致
      */
     private final CallbackMutex metadataMutex = new CallbackMutex();
     private final CallbackMutex trimmerMutex = new CallbackMutex();
@@ -234,6 +225,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     private long maximumRolloverTimeMs;
     protected final Supplier<CompletableFuture<Boolean>> mlOwnershipChecker;
 
+    //Topic中最后一条数据的Position
     volatile PositionImpl lastConfirmedEntry;
 
     protected ManagedLedgerInterceptor managedLedgerInterceptor;
@@ -296,6 +288,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     @Getter
     private final OrderedScheduler scheduledExecutor;
 
+    // 一切要CUD元数据，缓存，bookie的操作，都通过这个executor来，单线程执行。
     @Getter
     protected final Executor executor;
 
@@ -322,6 +315,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     /**
      * Queue of pending entries to be added to the managed ledger. Typically, entries are queued when a new ledger is.
      * created asynchronously and hence there is no ready ledger to write into.
+     * 若处于切换ledger状态，如一个ledger写满了在创建新的ledger时，先存到这里就是很有用的了。
+     * 若创建ledger超时，也会根据这里的entry的callback写回异常
      */
     final ConcurrentLinkedQueue<OpAddEntry> pendingAddEntries = new ConcurrentLinkedQueue<>();
 
@@ -374,6 +369,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         this.maxBacklogBetweenCursorsForCaching = config.getMaxBacklogBetweenCursorsForCaching();
     }
 
+    //synchronized:锁了个寂寞
+    // 先从ZK恢复ledger的id，再从bk中恢复最后一个ledger的信息（这个ledger不一定被更新了，也可能是空的，只在创建时更新过）
+    // 然后更新缓存，剔除空ledger，创新的Ledger用于写入，之前的Ledger会可读。然后开启一些初始化的定时任务，更新缓存。
+    // 最终保证本次的ML缓存--持久化--zk都是一致的，就初始化所有游标。
     synchronized void initialize(final ManagedLedgerInitializeLedgerCallback callback, final Object ctx) {
         log.info("Opening managed ledger {}", name);
 
@@ -393,7 +392,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 }
 
                 if (mlInfo.getPropertiesCount() > 0) {
-                    propertiesMap = new HashMap();
+                    propertiesMap = new HashMap<>();
                     for (int i = 0; i < mlInfo.getPropertiesCount(); i++) {
                         MLDataFormats.KeyValue property = mlInfo.getProperties(i);
                         propertiesMap.put(property.getKey(), property.getValue());
@@ -405,10 +404,14 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 }
 
                 // Last ledger stat may be zeroed, we must update it
+                // 根据bookie里读的信息更新last ledger
                 if (!ledgers.isEmpty()) {
                     final long id = ledgers.lastKey();
                     OpenCallback opencb = (rc, lh, ctx1) -> {
                         executor.execute(() -> {
+                            // 根据bookie里读的信息更新last ledger，所以这个回调要在bookeeper读了以后才能执行，所以调用了这个：
+                            // zk读的不一定是准的，zk是定期flush的，而且大概率最后一个ledger是空的，还没有更新到zk。
+                            // bookKeeper.asyncOpenLedger(id, digestType, config.getPassword(), opencb, null);
                             mbean.endDataLedgerOpenOp();
                             if (log.isDebugEnabled()) {
                                 log.debug("[{}] Opened ledger {}: {}", name, id, BKException.getMessage(rc));
@@ -471,10 +474,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
 
         // Calculate total entries and size
+        // 待删除ledger集合
         final List<Long> emptyLedgersToBeDeleted = Collections.synchronizedList(new ArrayList<>());
         Iterator<LedgerInfo> iterator = ledgers.values().iterator();
         while (iterator.hasNext()) {
             LedgerInfo li = iterator.next();
+            // 没数据的就删掉
             if (li.getEntries() > 0) {
                 NUMBER_OF_ENTRIES_UPDATER.addAndGet(this, li.getEntries());
                 TOTAL_SIZE_UPDATER.addAndGet(this, li.getSize());
@@ -520,7 +525,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             if (checkAndCompleteLedgerOpTask(rc, lh, ctx)) {
                 return;
             }
-
+            // 单线程执行以下内容
             executor.execute(() -> {
                 mbean.endDataLedgerCreateOp();
                 if (rc != BKException.Code.OK) {
@@ -531,12 +536,14 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 log.info("[{}] Created ledger {} after closed {}", name, lh.getId(),
                         currentLedger == null ? "null" : currentLedger.getId());
                 STATE_UPDATER.set(this, State.LedgerOpened);
+                // 启动了一个定期查询当前ledger是否需要切换的定时任务
                 updateLastLedgerCreatedTimeAndScheduleRolloverTask();
                 currentLedger = lh;
                 currentLedgerTimeoutTriggered = new AtomicBoolean();
 
                 lastConfirmedEntry = new PositionImpl(lh.getId(), -1);
                 // bypass empty ledgers, find last ledger with Message if possible.
+                // Topic中最后一条数据的Position
                 while (lastConfirmedEntry.getEntryId() == -1) {
                     Map.Entry<Long, LedgerInfo> formerLedger = ledgers.lowerEntry(lastConfirmedEntry.getLedgerId());
                     if (formerLedger != null) {
@@ -551,6 +558,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 ledgers.put(lh.getId(), info);
 
                 // Save it back to ensure all nodes exist
+                // 小更新一下
                 store.asyncUpdateLedgerIds(name, getManagedLedgerInfo(), ledgersStat, storeLedgersCb);
             });
         }, ledgerMetadata);
@@ -560,16 +568,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         if (log.isDebugEnabled()) {
             log.debug("[{}] initializing cursors", name);
         }
+        // 该方法线程安全，回调也是在本线程内触发的，因为内部使用了CompletableFuture的Async方法，又把线程指定回了本线程
         store.getCursors(name, new MetaStoreCallback<List<String>>() {
             @Override
-            public void operationComplete(List<String> consumers, Stat s) {
+            public void operationComplete(List<String> zkCursorCaches, Stat s) {
                 // Load existing cursors
-                final AtomicInteger cursorCount = new AtomicInteger(consumers.size());
+                final AtomicInteger cursorCount = new AtomicInteger(zkCursorCaches.size());
                 if (log.isDebugEnabled()) {
-                    log.debug("[{}] Found {} cursors", name, consumers.size());
+                    log.debug("[{}] Found {} cursors", name, zkCursorCaches.size());
                 }
 
-                if (consumers.isEmpty()) {
+                if (zkCursorCaches.isEmpty()) {
                     callback.initializeComplete();
                     return;
                 }
@@ -577,7 +586,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 if (!ManagedLedgerImpl.this.config.isLazyCursorRecovery()) {
                     log.debug("[{}] Loading cursors", name);
 
-                    for (final String cursorName : consumers) {
+                    for (final String cursorName : zkCursorCaches) {
                         log.info("[{}] Loading cursor {}", name, cursorName);
                         final ManagedCursorImpl cursor;
                         cursor = new ManagedCursorImpl(bookKeeper, ManagedLedgerImpl.this, cursorName);
@@ -588,7 +597,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                 log.info("[{}] Recovery for cursor {} completed. pos={} -- todo={}", name, cursorName,
                                         cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
                                 cursor.setActive();
-                                addCursor(cursor);
+                                ManagedLedgerImpl.this.addCursor(cursor);
 
                                 if (cursorCount.decrementAndGet() == 0) {
                                     // The initialization is now completed, register the jmx mbean
@@ -606,7 +615,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     }
                 } else {
                     // Lazily recover cursors by put them to uninitializedCursors map.
-                    for (final String cursorName : consumers) {
+                    for (final String cursorName : zkCursorCaches) {
                         if (log.isDebugEnabled()) {
                             log.debug("[{}] Recovering cursor {} lazily", name, cursorName);
                         }
@@ -622,7 +631,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                         cursorName, cursor.getMarkDeletedPosition(), cursorCount.get() - 1);
                                 cursor.setActive();
                                 synchronized (ManagedLedgerImpl.this) {
-                                    addCursor(cursor);
+                                    ManagedLedgerImpl.this.addCursor(cursor);
                                     uninitializedCursors.remove(cursor.getName()).complete(cursor);
                                 }
                             }
@@ -764,7 +773,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         ByteBuf buffer = Unpooled.wrappedBuffer(data, offset, length);
         asyncAddEntry(buffer, numberOfMessages, callback, ctx);
     }
-
+    // callback是persistentTopic，内部方法使用后应当调用addComplete或addFailed方法
     @Override
     public void asyncAddEntry(ByteBuf buffer, AddEntryCallback callback, Object ctx) {
         if (log.isDebugEnabled()) {
@@ -772,10 +781,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
 
         // retain buffer in this thread
+        // 每个线程将buffer传递前需要计数+1，每个线程使用结束后release，只负责回收自己的引用计数即可。
         buffer.retain();
-
+        // （引用计数现在是2）
         // Jump to specific thread to avoid contention from writers writing from different threads
         executor.execute(() -> {
+            // 下面方法直接使用上面的buffer引用，没有进行复制与额外retain，相当于addOperation对象持有的就是原引用计数器
             OpAddEntry addOperation = OpAddEntry.createNoRetainBuffer(this, buffer, callback, ctx,
                     currentLedgerTimeoutTriggered);
             internalAsyncAddEntry(addOperation);
@@ -787,10 +798,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         if (log.isDebugEnabled()) {
             log.debug("[{}] asyncAddEntry size={} state={}", name, buffer.readableBytes(), state);
         }
-
         // retain buffer in this thread
         buffer.retain();
 
+        // 每个managedLedger在初始化的时候，都会从bk中分配一个写入线程，通过名字分配，从bk的线程池数组里面拿一个(线程池数组的线程池都是单线程线程池)，
+        // 因此这里相当于一个固定的线程，其目的在于保证不同工作线程的producer在发送时按序发送
         // Jump to specific thread to avoid contention from writers writing from different threads
         executor.execute(() -> {
             OpAddEntry addOperation = OpAddEntry.createNoRetainBuffer(this, buffer, numberOfMessages, callback, ctx,
@@ -799,6 +811,15 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         });
     }
 
+    // 单线程执行只保证了多线程调用这个方法会串行化，其目的是保持写入顺序和接受到的发送请求顺序相同，
+    // 而不是为了解决全部的线程安全问题（除非所有的请求都用这个线程）
+    // 由于内部修改了大量成员变量，这些成员变量还会在其他方法里被修改，因此这些方法都要上同步监视器锁，以保证原子性
+    // createLedgerAfterClosed方法也能说明为什么这个方法要同步
+
+    // 而且大概率这个方法是偏向锁的，不会消耗多少性能
+    // 只有在疯狂发送，且写满的时候还在疯狂发送的时候，才会出现createLedgerAfterClosed和该方法对于创建ledger时的并发问题，这时候有可能会触发
+    // 同步锁，因为createLedgerAfterClosed有一种可能是来自正常关闭写满ledger的zk回调的，是另一个线程。这两个方法都需要根据state的状态判断
+    // 是否创建新的ledger
     protected synchronized void internalAsyncAddEntry(OpAddEntry addOperation) {
         if (!beforeAddEntry(addOperation)) {
             return;
@@ -825,6 +846,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] Queue addEntry request", name);
             }
+            // 创建超时就直接返回，不需要注册回调，createComplete会清空所有pending的entry，并且调节state为close或者writefail，
+            // 后续写入请求需要等待createLedger请求的回调返回。
             if (State.CreatingLedger == state) {
                 long elapsedMs = System.currentTimeMillis() - this.lastLedgerCreationInitiationTimestamp;
                 if (elapsedMs > TimeUnit.SECONDS.toMillis(2 * config.getMetadataOperationsTimeoutSeconds())) {
@@ -855,7 +878,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 log.debug("[{}] Write into current ledger lh={} entries={}", name, currentLedger.getId(),
                         currentLedgerEntries);
             }
-
+            // 根据ledger条数currentLedgerEntries是否到达配置，以及是否超过ledger切换配置时间，来判断是否要切换ledger了
             if (currentLedgerIsFull()) {
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Closing current ledger lh={}", name, currentLedger.getId());
@@ -976,11 +999,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
 
         if (uninitializedCursors.containsKey(cursorName)) {
-            uninitializedCursors.get(cursorName).thenAccept(cursor -> callback.openCursorComplete(cursor, ctx))
+            uninitializedCursors.get(cursorName)
+                    .thenAccept(cursor -> callback.openCursorComplete(cursor, ctx))
                     .exceptionally(ex -> {
-                callback.openCursorFailed((ManagedLedgerException) ex, ctx);
-                return null;
-            });
+                        callback.openCursorFailed((ManagedLedgerException) ex, ctx);
+                        return null;
+                    });
             return;
         }
         ManagedCursor cachedCursor = cursors.get(cursorName);
@@ -1118,6 +1142,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                              InitialPosition initialPosition, boolean isReadCompacted)
             throws ManagedLedgerException {
         Objects.requireNonNull(cursorName, "cursor name can't be null");
+        // synchronized锁在topic里面，不在这个类里面
         checkManagedLedgerIsOpen();
         checkFenced();
 
@@ -1727,9 +1752,34 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
     }
 
+    public CompletableFuture<Void> asyncRefreshVersion() {
+        CompletableFuture<Void> res = new CompletableFuture<>();
+        if (!state.isFenced()) {
+            res.completeExceptionally(new BadVersionException("The ledger is not fenced"));
+            return res;
+        }
+        store.getManagedLedgerInfo("", false, new MetaStoreCallback<>() {
+            @Override
+            public void operationComplete(ManagedLedgerInfo result, Stat stat) {
+                ManagedLedgerImpl.this.ledgersStat = stat;
+                res.complete(null);
+            }
+
+            @Override
+            public void operationFailed(MetaStoreException e) {
+                res.completeExceptionally(e);
+            }
+        });
+        return res;
+    }
+
     // //////////////////////////////////////////////////////////////////////
     // Private helpers
 
+    // 由ml线程调用该方法，正常情况下，直接顺序执行了，后面的写入请求会阻塞，直到该方法执行完毕，因此会由最后一个写入entry的回调触发该方法，
+    // 进而触发createLedgerAfterClosed()方法。也就是说时间图如下：
+    // ml线程：  写入请求1 -> 写入请求2（写满）-> 写入请求3 -> 1的回调 -> 写入请求4 -> 2的回调（closingLedger -> State）-> 触发重建
+    // -> 其余线程阻塞 -> 重建成功 -> poll pending队列并执行积压
     synchronized void ledgerClosed(final LedgerHandle lh) {
         final State state = STATE_UPDATER.get(this);
         LedgerHandle currentLedger = this.currentLedger;
@@ -1773,6 +1823,16 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
     }
 
+    // 这方法是synchronized的，正常写满关闭ledger的线程会调用这个，另一个能创建ledger的地方在
+    // internalasyncAddentry里面那个cas修改closed->creating的情况
+
+    // 并发执行，所以当然安全，不会导致多次创建ledger，最终只有一个线程会正确创建ledger
+    // internalasyncAddentry里面那个也只是为了快点创建，防止用的时候回调还没返回，或者超时了之类的。
+
+    // 这也就说明了为啥internalasyncAddentry是同步的，因为有些线程确实会和它并发执行。
+    // 它基本等同于下面那个注释的方法，不同的是，它不需要同步
+    // 但是由于还有可能在回调过程中处于其他的情况，不一定还是closedLedger状态，所以应该是有别的考虑的
+    // Tips 其实这个方法没必要是同步修饰的，因为调它的方法已经是同步修饰的了，这里直接重入了。
     synchronized void createLedgerAfterClosed() {
         if (isNeededCreateNewLedgerAfterCloseLedger()) {
             log.info("[{}] Creating a new ledger after closed {}", name,
@@ -1782,11 +1842,28 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             mbean.startDataLedgerCreateOp();
             // Use the executor here is to avoid use the Zookeeper thread to create the ledger which will lead
             // to deadlock at the zookeeper client, details to see https://github.com/apache/pulsar/issues/13736
+            // 这个方法可能会被bk线程池回调，其bk内部会使用metadata的线程池回调该方法，而所有的逻辑处理完毕后（即该方法结束后的bk回调里），应该
+            // 会释放某个锁，但是如果在释放前再次请求锁，就会出现死锁问题了，更改线程即可。
             this.executor.execute(() ->
                     asyncCreateLedger(bookKeeper, config, digestType, this, Collections.emptyMap()));
         }
     }
 
+//    void createLedgerAfterClosedMine() {
+//        if (STATE_UPDATER.compareAndSet(this, State.ClosingLedger, State.LedgerOpened)) {
+//            log.info("[{}] Creating a new ledger after closed {}", name,
+//                    currentLedger == null ? "null" : currentLedger.getId());
+//            this.lastLedgerCreationInitiationTimestamp = System.currentTimeMillis();
+//            mbean.startDataLedgerCreateOp();
+//            // Use the executor here is to avoid use the Zookeeper thread to create the ledger which will lead
+//            // to deadlock at the zookeeper client, details to see https://github.com/apache/pulsar/issues/13736
+//            // 这个方法可能会被bk线程池回调，其bk内部会使用metadata的线程池回调该方法，而所有的逻辑处理完毕后（即该方法结束后的bk回调里），应该
+//            // 会释放某个锁，但是如果在释放前再次请求锁，就会出现死锁问题了，更改线程即可。
+//            this.executor.execute(() ->
+//                    asyncCreateLedger(bookKeeper, config, digestType, this, Collections.emptyMap()));
+//        }
+//    }
+//
     boolean isNeededCreateNewLedgerAfterCloseLedger() {
         final State state = STATE_UPDATER.get(this);
         if (state != State.CreatingLedger && state != State.LedgerOpened) {
@@ -2595,7 +2672,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     /**
      * Checks whether there are ledger that have been fully consumed and deletes them.
-     *
+     * 修剪ledgers，看看哪些消费完了就扔掉。
+     * truncate: 是否截断（删掉）
      * @throws Exception
      */
     void internalTrimConsumedLedgers(CompletableFuture<?> promise) {
@@ -2610,12 +2688,15 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
 
         // Ensure only one trimming operation is active
+        // 上一个元数据的回调锁
         if (!trimmerMutex.tryLock()) {
             scheduleDeferredTrimming(isTruncate, promise);
             return;
         }
 
+        // 待删除ledgers列表（物理删除）
         List<LedgerInfo> ledgersToDelete = new ArrayList<>();
+        // 待卸载删除列表，可以用于配置HDFS，实现卸载+写入HDFS长期存储
         List<LedgerInfo> offloadedLedgersToDelete = new ArrayList<>();
         Optional<OffloadPolicies> optionalOffloadPolicies = Optional.ofNullable(config.getLedgerOffloader() != null
                 && config.getLedgerOffloader() != NullLedgerOffloader.INSTANCE
@@ -2651,6 +2732,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 // At this point the lastLedger will be pointing to the
                 // ledger that has just been closed, therefore the +1 to
                 // include lastLedger in the trimming.
+                // 如果全都是非持久化Cursor，没有消费完的ledger也不可能关闭，不像持久化的可以恢复（我猜的
                 slowestReaderLedgerId = currentLedger.getId() + 1;
             } else {
                 PositionImpl slowestReaderPosition = cursors.getSlowestReaderPosition();
@@ -2662,6 +2744,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     if (ledgerInfo != null && ledgerInfo.getLedgerId() != currentLedger.getId()
                             && ledgerInfo.getEntries() == slowestReaderPosition.getEntryId() + 1) {
                         slowestReaderLedgerId = slowestReaderPosition.getLedgerId() + 1;
+                        //这种情况是：最慢的那个游标的位置恰好是对应ledger的最后一条
+                        // slowestCursor位置：  a:b
+                        // slowestCursor所在的ledger信息： a:c   b + 1 = c
                     } else {
                         slowestReaderLedgerId = slowestReaderPosition.getLedgerId();
                     }
@@ -2678,6 +2763,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
             long totalSizeToDelete = 0;
             // skip ledger if retention constraint met
+            // 拿到所有最慢标记前的ledger信息集合
             Iterator<LedgerInfo> ledgerInfoIterator =
                     ledgers.headMap(slowestReaderLedgerId, false).values().iterator();
             while (ledgerInfoIterator.hasNext()){
@@ -2711,7 +2797,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                             name, ls.getLedgerId(), (clock.millis() - ls.getTimestamp()) / 1000.0, expired,
                             overRetentionQuota, currentLedger.getId());
                 }
-
+                // 满足过期策略的，删了
                 if (expired || overRetentionQuota) {
                     if (log.isDebugEnabled()) {
                         log.debug("[{}] Ledger {} has expired or over quota, expired is: {}, ts: {}, "
@@ -2720,10 +2806,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     }
                     ledgersToDelete.add(ls);
                 } else {
+                    // 后面也不用再循环了，后面肯定没达到quota
                     // once retention constraint has been met, skip check
                     if (log.isDebugEnabled()) {
                         log.debug("[{}] Ledger {} not deleted. Neither expired nor over-quota", name, ls.getLedgerId());
                     }
+                    // 关掉bookie中的读handle，应该是一个tcp读连接。
                     releaseReadHandleIfNoLongerRead(ls.getLedgerId(), slowestNonDurationLedgerId.getValue());
                     break;
                 }
@@ -2735,7 +2823,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     break;
                 }
             }
-
+            // 按照卸载策略进行卸载备份
             for (LedgerInfo ls : ledgers.values()) {
                 if (isOffloadedNeedsDelete(ls.getOffloadContext(), optionalOffloadPolicies)
                         && !ledgersToDelete.contains(ls)) {
@@ -2753,6 +2841,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
             if (currentState == State.CreatingLedger // Give up now and schedule a new trimming
                     || !metadataMutex.tryLock()) { // Avoid deadlocks with other operations updating the ledgers list
+                // 元数据锁竞争失败，可能是有别的线程在更新元数据。
                 scheduleDeferredTrimming(isTruncate, promise);
                 trimmerMutex.unlock();
                 return;
@@ -2866,6 +2955,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
      * Non-durable cursors have to be moved forward when data is trimmed since they are not retain that data.
      * This is to make sure that the `consumedEntries` counter is correctly updated with the number of skipped
      * entries and the stats are reported correctly.
+     * 无论非持久化订阅消费到哪里了，都不要了，按照持久化的来。
      */
     @VisibleForTesting
     void advanceCursorsIfNecessary(List<LedgerInfo> ledgersToDelete) throws LedgerNotExistException {

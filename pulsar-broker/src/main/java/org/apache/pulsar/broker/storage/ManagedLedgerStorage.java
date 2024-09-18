@@ -79,7 +79,10 @@ public interface ManagedLedgerStorage extends AutoCloseable {
 
     /**
      * Initialize the {@link ManagedLedgerStorage} from the provided resources.
-     *
+     * <P>根据配置反射出一个Storage工厂实现类 即本接口实现类</P>
+     * <P>为什么用这种形式? 因为可以在接口里强制你的实现类实现initial方法，并在这里调用，强制统一了实现类</P>
+     * <P>如果采用子类自行实现构造函数式实现，还需要在这个方法里对构造函数参数校验才能反射，如果某个实现类未对齐参数，那就会出现异常</P>
+     * <P>因此这种方式要优于构造函数反射</P>
      * @param conf service config
      * @param bkProvider bookkeeper client provider
      * @return the initialized managed ledger storage.
@@ -88,6 +91,7 @@ public interface ManagedLedgerStorage extends AutoCloseable {
                                        MetadataStoreExtended metadataStore,
                                        BookKeeperClientFactory bkProvider,
                                        EventLoopGroup eventLoopGroup) throws Exception {
+        // 返回一个配置中的，ManagedLedgerStorage的实现类
         ManagedLedgerStorage storage =
                 Reflections.createInstance(conf.getManagedLedgerStorageClassName(), ManagedLedgerStorage.class,
                         Thread.currentThread().getContextClassLoader());

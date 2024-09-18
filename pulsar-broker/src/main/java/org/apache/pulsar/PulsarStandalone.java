@@ -278,8 +278,8 @@ public class PulsarStandalone implements AutoCloseable {
             System.exit(1);
         }
 
-        String forceUseZookeeperEnv = System.getenv(PULSAR_STANDALONE_USE_ZOOKEEPER);
-
+        //String forceUseZookeeperEnv = System.getenv(PULSAR_STANDALONE_USE_ZOOKEEPER);
+        String forceUseZookeeperEnv = "true";
         // Allow forcing to use ZK mode via an env variable. eg:
         // PULSAR_STANDALONE_USE_ZOOKEEPER=1
         if (StringUtils.equalsAnyIgnoreCase(forceUseZookeeperEnv, "1", "true")) {
